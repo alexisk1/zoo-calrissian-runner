@@ -549,11 +549,15 @@ class ZooCalrissianRunner:
         self.update_status(progress=99, message="clean-up processing resources")
 
         # use an environment variable to decide if we want to clean up the resources
-        if os.environ.get("KEEP_SESSION", "false") == "false":
-            logger.info("clean-up kubernetes resources")
-            session.dispose()
+        # in case a dedicated namespace is used we want to keep the namespace
+        # and associacted service account
+        keep_session = os.environ.get("KEEP_SESSION", "false").lower() == "true"
+        use_dedicated_namespace = self.dedicated_namespace is not None
+
+        if not keep_session:
+            session.dispose(preserve_namespace=use_dedicated_namespace)
         else:
-            logger.info("kubernetes resources not cleaned up")
+            logger.info("KEEP_SESSION=true, skipping cleanup.")
 
         self.update_status(
             progress=100,
