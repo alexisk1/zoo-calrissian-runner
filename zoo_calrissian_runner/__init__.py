@@ -1,11 +1,11 @@
 import inspect
 import os
-import sys
 import uuid
-from datetime import datetime
-from typing import Union
-
+import json
 import attr
+from datetime import datetime
+from typing import Union, Optional, Tuple, Dict, Any
+
 import cwl_utils
 from cwl_utils.parser import load_document_by_yaml
 from cwl_wrapper.parser import Parser
@@ -16,6 +16,9 @@ from pycalrissian.job import CalrissianJob
 from pycalrissian.utils import copy_to_volume
 
 from zoo_calrissian_runner.handlers import ExecutionHandler
+from zoo_calrissian_runner.diagnostics import (
+    classify_from_report,
+)
 
 # useful class for hints in CWL
 @attr.s
@@ -40,8 +43,10 @@ except ImportError:
 
     class ZooStub(object):
         def __init__(self):
-            self.SERVICE_SUCCEEDED = 3
+            self.SERVICE_SUCCEEDED = 0
             self.SERVICE_FAILED = 4
+            self.SERVICE_KILLED = 5
+            self.SERVICE_OUT_OUT_OF_RESOURCES = 6
 
         def update_status(self, conf, progress):
             print(f"Status {progress}")
@@ -292,34 +297,37 @@ class ZooCalrissianRunner:
         conf,
         inputs,
         outputs,
+        dedicated_namespace: bool = False,
         execution_handler: Union[ExecutionHandler, None] = None,
     ):
         self.zoo_conf = ZooConf(conf)
         self.inputs = ZooInputs(inputs)
         self.outputs = ZooOutputs(outputs)
         self.cwl = Workflow(cwl, self.zoo_conf.workflow_id)
+        self.failure_reason_message = ""
 
         self.handler = execution_handler
 
-        self.storage_class = os.environ.get("STORAGE_CLASS", "openebs-nfs-test")
-        if self.handler is not None:
-            self.dedicated_namespace = self.handler.get_namespace()
-        else:
-            self.dedicated_namespace = None
+        self.storage_class = os.environ.get("STORAGE_CLASS", "openebs-nfs-test")    
+
+        self.dedicated_namespace = dedicated_namespace
+        logger.info(f"Use dedicated namespace flag: {str(self.dedicated_namespace )}")
+        if self.dedicated_namespace and self.handler is not None:
+            self._namespace_name = None
+            self._workdir_name = self.get_namespace_name()
+            self._namespace_name = self.handler.get_namespace()
+            logger.info(f"Using dedicated namespace: {str(self._namespace_name)}")
+
         self.monitor_interval = 30
-        if "lenv" in self.zoo_conf.conf and "usid" in self.zoo_conf.conf["lenv"]:
-            if self.dedicated_namespace is None:
-                uuidString=self.zoo_conf.conf['lenv']['usid']
+        if "lenv" in self.zoo_conf.conf and "usid" in self.zoo_conf.conf["lenv"] and \
+            not self.dedicated_namespace:
+                uuidString = self.zoo_conf.conf['lenv']['usid']
                 self._namespace_name = ZooCalrissianRunner.shorten_namespace(
                     f"{str(self.zoo_conf.workflow_id).replace('_', '-')}-"
                     f"{uuidString}"
                 )
-            else:
-                self._namespace_name = self.shorten_namespace(
-                    self.dedicated_namespace
-                )
-        else:
-            self._namespace_name = None
+                self._workdir_name = self._namespace_name
+                logger.info(f"Using new namespace: {str(self._namespace_name)}")
 
     @staticmethod
     def shorten_namespace(value: str) -> str:
@@ -329,6 +337,12 @@ class ZooCalrissianRunner:
             while value.endswith("-"):
                 value = value[:-1]
         return value
+
+    def get_zoo_job_id(self) -> str:
+        return self.zoo_conf.conf['lenv']['usid']
+
+    def get_workdir_name(self) -> str:
+        return self._workdir_name
 
     def get_volume_size(self) -> str:
         """returns volume size that the pods share"""
@@ -373,12 +387,11 @@ class ZooCalrissianRunner:
     def get_namespace_name(self):
         """creates or returns the namespace"""
         if self._namespace_name is None:
-            return self.shorten_namespace(
+            self._namespace_name = self.shorten_namespace(
                 f"{str(self.zoo_conf.workflow_id).replace('_', '-')}-"
                 f"{str(datetime.now().timestamp()).replace('.', '')}-{uuid.uuid4()}"
             )
-        else:
-            return self._namespace_name
+        return self._namespace_name
 
     def update_status(self, progress: int, message: str = None) -> None:
         """updates the execution progress (%) and provides an optional message"""
@@ -407,8 +420,66 @@ class ZooCalrissianRunner:
         )
 
     def get_annotations(self):
-        """Get the labels for the execution."""
-        return self.zoo_conf.conf["pod_annotations"] if "pod_annotations" in self.zoo_conf.conf else None
+        """Get the annotations for the execution."""
+        # Get zoo annotations
+        logger.info("Combining zoo and handler's pod annotations")
+        zoo_annotations = self.zoo_conf.conf.get("pod_annotations") or {}
+
+        # Get handler's annotations
+        handler_annotations = {}
+        if getattr(self, "handler", None) is not None and \
+            callable(getattr(self.handler, "get_pod_annotations", None)):
+            handler_annotations = self.handler.get_pod_annotations() or {}
+        
+        logger.info("zoo_annotations: " + str(zoo_annotations))
+        logger.info("handler_annotations: " + str(handler_annotations))
+        return {**zoo_annotations, **handler_annotations} # prefer handler
+
+
+    def determine_termination_reason(
+        self,
+        calrissian_exit_status: Optional[Dict[str, Any]],
+        usage_report: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Determine a final human-readable termination reason and message.
+
+        Preference order:
+          1) Monitor/job-pod cause (either exit_status argument or self.execution.kill_cause)
+          2) Fall back to classification from job status + report.json via
+             build_final_reason_from_status_and_report(self.execution, usage_report)
+
+        Side effect:
+          - If usage_report is provided, annotates usage_report["_diagnostics"]
+            with "reason" and "message".
+
+        Returns:
+        Returns a normalized kill_cause dict:
+        {"step": <str>, "exit_code": <int>, "error_msg": <str>, "reason": <str>}
+        """
+        # Prefer the monitor/job-pod cause (already a dict)
+        if calrissian_exit_status:
+            logger.info("Building final kill_cause from job exit status only")
+            kill_cause = calrissian_exit_status  # <-- use as-is (no json.dumps)
+        else:
+            # Fall back to job status + report.json classification
+            logger.info("Building final kill_cause from report.json only")
+            kill_cause = classify_from_report(usage_report)
+            logger.info(f"Using cwl step report kill_cause: {str(kill_cause)}")
+
+        # Attach to usage_report for downstream consumers
+        try:
+            if usage_report is not None:
+                diag = usage_report.setdefault("_diagnostics", {})
+                diag["kill_cause"] = kill_cause
+        except Exception as e:
+            logger.warning("Could not annotate usage_report with diagnostics: %s", e)
+
+        self.failure_reason_message = kill_cause
+        return kill_cause
+    
+    def get_termination_reason(self):
+        return self.failure_reason_message 
 
     def execute(self, wall_time=None):
         self.update_status(progress=2, message="Pre-execution hook")
@@ -436,13 +507,14 @@ class ZooCalrissianRunner:
 
         logger.info(f"namespace: {namespace}")
 
-        if self.dedicated_namespace is None:
+        if not self.dedicated_namespace:
             session = CalrissianContext(
                 namespace=namespace,
                 storage_class=self.storage_class,
                 volume_size=self.get_volume_size(),
                 image_pull_secrets=secret_config,
                 annotations=self.get_annotations(),
+                labels={"job-id": self.get_zoo_job_id()}
             )
         else:
             logger.info("Using pre-existing namespace")
@@ -452,8 +524,10 @@ class ZooCalrissianRunner:
                 volume_size=self.get_volume_size(),
                 image_pull_secrets=secret_config,
                 annotations=self.get_annotations(),
-                service_account=self.handler.get_service_account(),
+                labels={"job-id": self.get_zoo_job_id()},
+                service_account=self.handler.get_service_account()
             )
+
         session.initialise()
         self.update_status(progress=15, message="processing environment created, preparing execution")
 
@@ -492,6 +566,7 @@ class ZooCalrissianRunner:
         # checks if all parameters where provided
 
         logger.info("create Calrissian job")
+        logger.info(f"annotations: {str(self.get_annotations())}")
         job = CalrissianJob(
             cwl=wrapped_workflow,
             params=processing_parameters,
@@ -501,9 +576,11 @@ class ZooCalrissianRunner:
             max_ram=self.get_max_ram(),
             pod_env_vars=self.handler.get_pod_env_vars(),
             pod_node_selector=self.handler.get_pod_node_selector(),
+            pod_annotations=self.get_annotations(),
             debug=True,
             no_read_only=True,
             tool_logs=True,
+            ttl_seconds_after_finished=1800
         )
 
         self.update_status(progress=23, message="execution submitted")
@@ -512,59 +589,94 @@ class ZooCalrissianRunner:
         self.execution = CalrissianExecution(job=job, runtime_context=session)
         self.execution.submit()
 
-        self.execution.monitor(interval=self.monitor_interval, wall_time=wall_time)
+        calrissian_error_message = self.execution.monitor(interval=self.monitor_interval, wall_time=wall_time)
+        if calrissian_error_message:
+            logger.info(f"Monitor terminated job with cause={calrissian_error_message}")
 
         if self.execution.is_complete():
             logger.info("execution complete")
 
-        if self.execution.is_succeeded():
-            exit_value = zoo.SERVICE_SUCCEEDED
-        else:
-            exit_value = zoo.SERVICE_FAILED
-
         self.update_status(progress=90, message="delivering outputs, logs and usage report")
 
         logger.info("handle outputs execution logs")
-        output = self.execution.get_output()
-        log = self.execution.get_log()
-        usage_report = self.execution.get_usage_report()
+        output, log, usage_report, tool_logs = None, None, None, None
+
+        try:
+            output = self.execution.get_output()
+        except Exception as e:
+            logger.info("Cannot get outputs exception: " + str(e))
+        try:
+            log = self.execution.get_log()
+        except Exception as e:
+            logger.info("Cannot get log exception: " + str(e))
+        try:
+            usage_report = self.execution.get_usage_report()
+        except Exception as e:
+            logger.info("Cannot get usage report exception: " + str(e))
+        try:
+            tool_logs = self.execution.get_tool_logs()
+        except Exception as e:
+            logger.info("Cannot get tool logs  exception: " + str(e))
         tool_logs = self.execution.get_tool_logs()
 
         self.outputs.set_output(output)
 
-        self.handler.handle_outputs(
-            log=log,
-            output=output,
-            usage_report=usage_report,
-            tool_logs=tool_logs,
-        )
+        try:
+            self.handler.handle_outputs(
+                log=log,
+                output=output,
+                usage_report=usage_report,
+                tool_logs=tool_logs,
+            )
+        except Exception as e:
+            logger.info("Service template handle_outputs error: " + str(e))
+
 
         self.update_status(progress=97, message="Post-execution hook")
-        self.handler.post_execution_hook(
-            log=log,
-            output=output,
-            usage_report=usage_report,
-            tool_logs=tool_logs,
-        )
+        try:
 
+            self.handler.post_execution_hook(
+                log=log,
+                output=output,
+                usage_report=usage_report,
+                tool_logs=tool_logs,
+            )
+        except Exception as e:
+            logger.info("Service template post_execution_hook error: " + str(e))
+
+        # Clean up resources
         self.update_status(progress=99, message="clean-up processing resources")
 
         # use an environment variable to decide if we want to clean up the resources
         keep_session = os.environ.get("KEEP_SESSION", "false").lower() == "true"
-        use_dedicated_namespace = self.dedicated_namespace is not None
 
         if not keep_session:
-            session.dispose(preserve_namespace=use_dedicated_namespace, job_name=job.job_name)
+            logger.info(f"Session cleanup dedicated flag: {self.dedicated_namespace} job name: {job.job_name}")
+            session.dispose(preserve_namespace=self.dedicated_namespace, job_name=job.job_name)
         else:
             logger.info("KEEP_SESSION=true, skipping cleanup.")
 
+        if self.execution.is_complete():
+            logger.info("execution completed")
+
+        if self.execution.is_succeeded():
+            exit_value = zoo.SERVICE_SUCCEEDED
+            self.update_status(progress=100, message='execution was successful!')
+            return exit_value
+
+
+        failure_reason_message = self.determine_termination_reason(calrissian_error_message, usage_report)
+
+        # Final status + message
+        exit_value = zoo.SERVICE_FAILED
+        logger.info(f"exit_value={exit_value} reason={failure_reason_message}")
 
         self.update_status(
             progress=100,
-            message=f'execution {"failed" if exit_value == zoo.SERVICE_FAILED else "successful"}',
+            message=f"execution failed",
         )
-
         return exit_value
+
 
     def wrap(self):
         workflow_id = self.get_workflow_id()

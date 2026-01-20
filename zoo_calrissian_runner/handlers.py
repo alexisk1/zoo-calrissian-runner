@@ -44,7 +44,7 @@ class ExecutionHandler(ABC):
     @abstractmethod
     def get_additional_parameters(self):
         pass
-
+    
     @abstractmethod
     def get_pod_annotations(self):
         pass
